@@ -1,0 +1,11 @@
+python-dotenv
+requests
+SpeechRecognition
+sounddevice
+scipy
+pyautogui
+selenium
+webdriver-manager
+groq
+pyperclip
+pywinauto

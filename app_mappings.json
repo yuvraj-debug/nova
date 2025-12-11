@@ -1,0 +1,22 @@
+{
+  "notepad": "notepad.exe",
+  "whatsapp": "https://web.whatsapp.com/",
+  "instagram": "https://www.instagram.com/",
+  "chrome": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+  "alarms": "ms-clock:",
+  "clock": "ms-clock:",
+  "calculator": "calc.exe",
+  "edge": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+  "firefox": "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+  "vscode": "C:\\Users\\%USERNAME%\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe",
+  "code": "C:\\Users\\%USERNAME%\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe",
+  "cmd": "cmd.exe",
+  "powershell": "powershell.exe",
+  "explorer": "explorer.exe",
+  "settings": "ms-settings:",
+  "mail": "ms-mail:",
+  "calendar": "outlookcal:",
+  "camera": "microsoft.windows.camera:",
+  "snippingtool": "ms-screenclip:",
+  "spotify": "spotify:"
+}
