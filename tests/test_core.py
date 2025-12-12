@@ -21,6 +21,12 @@ class TestCore(unittest.TestCase):
         self.assertEqual(kind, 'url')
         self.assertIn('twitter.com/messages', val)
 
+    def test_resolve_brave_mapping(self):
+        kind, val = op.resolve_open_target(None, 'brave', 'open brave')
+        # Mapping should resolve to a local path (brave executable)
+        self.assertEqual(kind, 'path')
+        self.assertIn('brave', val.lower())
+
     def test_fuzzy_match_slack(self):
         kind, val = op.resolve_open_target(None, 'slak', 'open slack dms')
         # fuzzy match should resolve to slack

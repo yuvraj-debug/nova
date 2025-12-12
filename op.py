@@ -172,7 +172,8 @@ SPOTIFY_STARTUP_SLEEP = float(os.getenv('SPOTIFY_STARTUP_SLEEP', '1.2'))
 POST_SPACE_DELAY = float(os.getenv('POST_SPACE_DELAY', '0.6'))
 DEFAULT_OPEN_SLEEP = float(os.getenv('DEFAULT_OPEN_SLEEP', '1.0'))
 # Whether to automatically press Alt+Tab after an OPEN completes (useful to background the opened app)
-AUTO_ALT_TAB_AFTER_OPEN = os.getenv('AUTO_ALT_TAB_AFTER_OPEN', 'true').lower() in ['1', 'true', 'yes']
+# Default: false (do NOT Alt+Tab away automatically unless explicitly enabled)
+AUTO_ALT_TAB_AFTER_OPEN = os.getenv('AUTO_ALT_TAB_AFTER_OPEN', 'false').lower() in ['1', 'true', 'yes']
 # Prefer returning focus to the floating window after opening (default: true)
 AUTO_RETURN_FOCUS_AFTER_OPEN = os.getenv('AUTO_RETURN_FOCUS_AFTER_OPEN', 'true').lower() in ['1', 'true', 'yes']
 
