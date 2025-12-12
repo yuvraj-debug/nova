@@ -9,19 +9,17 @@ Features:
 - Natural language responses
 """
 
-import os
 import sys
-import threading
-import subprocess
-import time
 import io
-import json
-import speech_recognition as sr
-import sounddevice as sd
-import scipy.io.wavfile as wavfile
+import os
+import time
+import logging
+import threading
 import numpy as np
 import requests
 import urllib.parse
+import json
+import subprocess
 from dotenv import load_dotenv
 from groq import Groq
 import webbrowser
@@ -56,6 +54,23 @@ except Exception:
     HAS_SELENIUM = False
     webdriver = None
 
+# Optional lightweight GUI for a small floating status window
+try:
+    import tkinter as tk
+    HAS_TK = True
+except Exception:
+    tk = None
+    HAS_TK = False
+
+# Globals for floating window
+FLOATING_ROOT = None
+FLOATING_THREAD = None
+FLOATING_STATUS_LABEL = None
+FLOATING_ENTRY = None
+FLOATING_SEND_BUTTON = None
+# Whether UI listening is enabled (toggled via right-click menu)
+UI_LISTENING_ENABLED = True
+
 # Optional automation library for mouse/keyboard control
 try:
     import pyautogui
@@ -77,6 +92,21 @@ try:
 except Exception:
     HAS_PYWINAUTO = False
 
+# Optional speech and audio capture
+try:
+    import speech_recognition as sr
+    HAS_SR = True
+except Exception:
+    sr = None
+    HAS_SR = False
+
+try:
+    import sounddevice as sd
+    HAS_SD = True
+except Exception:
+    sd = None
+    HAS_SD = False
+
 # Current UI/system context (last opened app key from app_mappings.json)
 CURRENT_APP_CONTEXT = None
 LAST_OPENED_TARGET = None
@@ -87,6 +117,10 @@ LAST_OPENED_TARGET = None
 # Fix encoding for Windows console
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+# Basic logger
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -130,6 +164,17 @@ ACTION_LOG_FILE = os.path.join(os.path.dirname(__file__), 'action_log.jsonl')
 # Global flags
 stop_speaking = False
 is_speaking = False
+# When set to a future timestamp, Nova will pause wake-word listening until then
+LISTEN_SUSPEND_UNTIL = 0.0
+
+# Configurable sleep/delay values (seconds)
+SPOTIFY_STARTUP_SLEEP = float(os.getenv('SPOTIFY_STARTUP_SLEEP', '1.2'))
+POST_SPACE_DELAY = float(os.getenv('POST_SPACE_DELAY', '0.6'))
+DEFAULT_OPEN_SLEEP = float(os.getenv('DEFAULT_OPEN_SLEEP', '1.0'))
+# Whether to automatically press Alt+Tab after an OPEN completes (useful to background the opened app)
+AUTO_ALT_TAB_AFTER_OPEN = os.getenv('AUTO_ALT_TAB_AFTER_OPEN', 'true').lower() in ['1', 'true', 'yes']
+# Prefer returning focus to the floating window after opening (default: true)
+AUTO_RETURN_FOCUS_AFTER_OPEN = os.getenv('AUTO_RETURN_FOCUS_AFTER_OPEN', 'true').lower() in ['1', 'true', 'yes']
 
 def speak(text, language='en', rate=0, volume=100):
     """
@@ -148,6 +193,11 @@ def speak(text, language='en', rate=0, volume=100):
     try:
         # Split sentences for better control
         sentences = [s.strip() for s in text.replace('!', '.').split('.') if s.strip()]
+        # Update floating window status if present
+        try:
+            set_floating_status('Speaking...')
+        except Exception:
+            pass
         print("\n[SPEAKING]", flush=True)
         
         for sentence in sentences:
@@ -186,10 +236,283 @@ $speak.Volume = {volume}
             time.sleep(0.1)
         
         is_speaking = False
+        try:
+            set_floating_status('Idle')
+        except Exception:
+            pass
     
     except Exception as e:
         is_speaking = False
         print(f"[SPEAK ERROR] {e}")
+
+
+def _floating_loop(title='NOVA', width=420, height=120):
+    global FLOATING_ROOT
+    try:
+        root = tk.Tk()
+        FLOATING_ROOT = root
+        root.title(title)
+        # Larger fixed size to allow typed commands comfortably
+        root.geometry(f"{width}x{height}")
+        # Always on top
+        try:
+            root.wm_attributes('-topmost', True)
+        except Exception:
+            try:
+                root.attributes('-topmost', True)
+            except Exception:
+                pass
+        # Allow window to be resized and moved by the user
+        try:
+            root.resizable(True, True)
+        except Exception:
+            pass
+        # Simple label showing status (bigger font)
+        lbl = tk.Label(root, text=title, font=('Segoe UI', 11))
+        lbl.pack(side='top', expand=False, fill='x', padx=6, pady=4)
+        # Entry for typed prompt and send button (wider for comfortable typing)
+        entry = tk.Entry(root, width=48)
+        entry.pack(side='left', fill='x', expand=True, padx=6, pady=6)
+        # Allow pressing Enter to send the prompt
+        try:
+            entry.bind('<Return>', lambda event: send_prompt_from_ui(entry.get()))
+        except Exception:
+            pass
+        send_btn = tk.Button(root, text='Send', width=8, command=lambda: send_prompt_from_ui(entry.get()))
+        send_btn.pack(side='right')
+        # Store references in globals for external updates
+        try:
+            global FLOATING_STATUS_LABEL, FLOATING_ENTRY, FLOATING_SEND_BUTTON
+            FLOATING_STATUS_LABEL = lbl
+            FLOATING_ENTRY = entry
+            FLOATING_SEND_BUTTON = send_btn
+        except Exception:
+            pass
+        # Run the Tk mainloop (blocking)
+        # Right-click menu for toggle listening and quit
+        try:
+            menu = tk.Menu(root, tearoff=0)
+            menu.add_command(label='Toggle Listening', command=toggle_listening)
+            menu.add_command(label='Quit', command=lambda: stop_floating_window())
+            def on_right_click(event):
+                try:
+                    menu.tk_popup(event.x_root, event.y_root)
+                finally:
+                    menu.grab_release()
+            root.bind('<Button-3>', on_right_click)
+        except Exception:
+            pass
+
+        root.mainloop()
+    except Exception as e:
+        print(f"[FLOAT WINDOW ERROR] {e}")
+
+
+def start_floating_window(title='NOVA', width=420, height=120):
+    """Start an always-on-top floating window in a background thread."""
+    global FLOATING_THREAD, FLOATING_ROOT
+    if not HAS_TK:
+        print('[FLOATING] Tkinter not available; skipping floating window')
+        return False
+    if FLOATING_THREAD and FLOATING_THREAD.is_alive():
+        return True
+    t = threading.Thread(target=_floating_loop, args=(title, width, height), daemon=True)
+    FLOATING_THREAD = t
+    t.start()
+    # Wait briefly for root to be created
+    timeout = 0.5
+    waited = 0.0
+    while waited < timeout and FLOATING_ROOT is None:
+        time.sleep(0.05)
+        waited += 0.05
+    return FLOATING_ROOT is not None
+
+
+def stop_floating_window():
+    """Stop the floating window if running."""
+    global FLOATING_ROOT
+    try:
+        if FLOATING_ROOT:
+            try:
+                FLOATING_ROOT.destroy()
+            except Exception:
+                pass
+            FLOATING_ROOT = None
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def set_floating_status(text: str):
+    """Update floating window status label safely from any thread."""
+    try:
+        if FLOATING_ROOT and FLOATING_STATUS_LABEL:
+            try:
+                FLOATING_ROOT.after(0, lambda: FLOATING_STATUS_LABEL.config(text=text))
+            except Exception:
+                try:
+                    FLOATING_STATUS_LABEL.config(text=text)
+                except Exception:
+                    pass
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def set_floating_focus():
+    """Set focus to the floating entry safely from any thread."""
+    try:
+        if FLOATING_ROOT and FLOATING_ENTRY:
+            def _focus():
+                try:
+                    FLOATING_ENTRY.config(state='normal')
+                    FLOATING_ENTRY.delete(0, tk.END)
+                    FLOATING_ENTRY.focus_set()
+                except Exception:
+                    pass
+            try:
+                FLOATING_ROOT.after(0, _focus)
+            except Exception:
+                _focus()
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _maybe_auto_alt_tab():
+    """If configured and supported, press Alt+Tab briefly to background the opened app."""
+    try:
+        # If explicit alt-tab behavior requested, do that (legacy behavior)
+        if AUTO_ALT_TAB_AFTER_OPEN:
+            if not HAS_PYAUTOGUI:
+                return False
+            time.sleep(0.15)
+            try:
+                press_keys('alt+tab')
+                return True
+            except Exception:
+                return False
+
+        # Otherwise, if configured, try to bring the floating window back to foreground
+        if AUTO_RETURN_FOCUS_AFTER_OPEN and FLOATING_ROOT:
+            def _bring():
+                try:
+                    try:
+                        FLOATING_ROOT.attributes('-topmost', True)
+                    except Exception:
+                        pass
+                    try:
+                        FLOATING_ROOT.lift()
+                    except Exception:
+                        pass
+                    try:
+                        FLOATING_ROOT.focus_force()
+                    except Exception:
+                        pass
+                    try:
+                        # unset topmost shortly after
+                        FLOATING_ROOT.after(200, lambda: FLOATING_ROOT.attributes('-topmost', False))
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            try:
+                FLOATING_ROOT.after(50, _bring)
+            except Exception:
+                _bring()
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def toggle_listening():
+    """Toggle wake-word listening state via the floating UI."""
+    global UI_LISTENING_ENABLED, WAKE_WORD_ENABLED
+    UI_LISTENING_ENABLED = not UI_LISTENING_ENABLED
+    WAKE_WORD_ENABLED = UI_LISTENING_ENABLED
+    try:
+        set_floating_status('Listening ON' if UI_LISTENING_ENABLED else 'Listening OFF')
+    except Exception:
+        pass
+    return UI_LISTENING_ENABLED
+
+
+def send_prompt_from_ui(prompt: str, client=None, run_in_thread=True):
+    """Send a prompt typed in the floating window to the executor.
+    If run_in_thread=False, execute synchronously (useful for tests).
+    """
+    if not prompt or not prompt.strip():
+        return False
+
+    def work():
+        try:
+            # Indicate typing in the chat area and disable input while executing
+            try:
+                set_floating_status('Typing...')
+            except Exception:
+                pass
+            try:
+                if FLOATING_ROOT and FLOATING_ENTRY:
+                    def _ui_show_typing():
+                        try:
+                            FLOATING_ENTRY.delete(0, tk.END)
+                            FLOATING_ENTRY.insert(0, 'Typing...')
+                            FLOATING_ENTRY.config(state='disabled')
+                        except Exception:
+                            pass
+                    try:
+                        FLOATING_ROOT.after(0, _ui_show_typing)
+                    except Exception:
+                        _ui_show_typing()
+            except Exception:
+                pass
+            c = client
+            if not c:
+                try:
+                    c = create_nova()
+                except Exception:
+                    c = None
+            # Use execute_via_ai_plan to run system actions if possible
+            res = execute_via_ai_plan(c, prompt)
+            try:
+                set_floating_status('Idle')
+            except Exception:
+                pass
+            # Restore entry to focus and clear typing indicator
+            try:
+                if FLOATING_ROOT and FLOATING_ENTRY:
+                    def _ui_clear_and_focus():
+                        try:
+                            FLOATING_ENTRY.config(state='normal')
+                            FLOATING_ENTRY.delete(0, tk.END)
+                            FLOATING_ENTRY.focus_set()
+                        except Exception:
+                            pass
+                    try:
+                        FLOATING_ROOT.after(0, _ui_clear_and_focus)
+                    except Exception:
+                        _ui_clear_and_focus()
+            except Exception:
+                pass
+            return res
+        except Exception as e:
+            print(f"[FLOAT SEND ERROR] {e}")
+            try:
+                set_floating_status('Idle')
+            except Exception:
+                pass
+            return False
+
+    if run_in_thread:
+        threading.Thread(target=work, daemon=True).start()
+        return True
+    else:
+        return work()
 
 def search_duckduckgo(query):
     """
@@ -319,34 +642,54 @@ def get_voice_input(language='en', duration=10):
     Capture voice input using sounddevice + Google Speech Recognition
     Supports English and Hindi
     """
+    # Ensure required packages are available
+    if not HAS_SR:
+        print("[VOICE ERROR] speech_recognition not available; voice input disabled", flush=True)
+        return None
+    if not HAS_SD:
+        print("[VOICE ERROR] sounddevice not available; voice input disabled", flush=True)
+        return None
+
     recognizer = sr.Recognizer()
-    
+
     try:
         print("[LISTENING] Speak now...", flush=True)
-        
+        try:
+            set_floating_status('Listening...')
+        except Exception:
+            pass
+
         sample_rate = 16000
-        
+
         # Record audio
         audio_data = sd.rec(int(sample_rate * duration), samplerate=sample_rate, channels=1, dtype='float32')
         sd.wait()
-        
+
         # Convert to 16-bit PCM
         audio_data = (audio_data * 32767).astype(np.int16)
         audio = sr.AudioData(audio_data.tobytes(), sample_rate, 2)
-        
+
         print("[PROCESSING] Converting speech to text...", flush=True)
-        
+
         # Google Speech Recognition with language support
         if language == 'hi':
             text = recognizer.recognize_google(audio, language='hi-IN')
         else:
             text = recognizer.recognize_google(audio, language='en-US')
-        
+
         print(f"[YOU] {text}", flush=True)
+        try:
+            set_floating_status('Idle')
+        except Exception:
+            pass
         return text
-    
+
     except sr.UnknownValueError:
         print("[ERROR] Couldn't understand. Please speak again.", flush=True)
+        try:
+            set_floating_status('Idle')
+        except Exception:
+            pass
         return None
     except sr.RequestError as e:
         print(f"[ERROR] Speech service error: {e}", flush=True)
@@ -420,8 +763,9 @@ def get_ai_response(client, messages, language='en', preprompt=None):
     return full_response
 
 
-def generate_long_text(client, prompt_text, language='en'):
+def generate_long_text(client, prompt_text, language='en', progress=True, progress_step_chars=200):
     """Generate longer-form content (stories, novels, essays) using the AI model.
+    Streams the response and prints periodic progress updates when `progress=True`.
     Respects environment variable LONG_MAX_TOKENS for size (default 800).
     """
     model = os.getenv('GROQ_MODEL', 'llama-3.1-8b-instant')
@@ -437,25 +781,51 @@ def generate_long_text(client, prompt_text, language='en'):
         {"role": "user", "content": prompt_text}
     ]
 
-    completion = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        max_completion_tokens=long_max,
-        stream=False
-    )
-
-    # Non-streamed response
-    text = ''
+    # Try streaming response for progress
     try:
-        text = completion.choices[0].message.content
-    except Exception:
-        # fallback: try streaming concatenation
-        for chunk in completion:
-            if chunk.choices[0].delta.content:
-                text += chunk.choices[0].delta.content
+        completion = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_completion_tokens=long_max,
+            stream=True
+        )
 
-    return text.strip()
+        text = ''
+        next_progress = progress_step_chars
+        for chunk in completion:
+            try:
+                if chunk.choices[0].delta.content:
+                    text += chunk.choices[0].delta.content
+                    if progress and len(text) >= next_progress:
+                        print(f"[PROGRESS] Generated {len(text)} chars...", flush=True)
+                        next_progress += progress_step_chars
+            except Exception:
+                # non-streamed or unexpected format; ignore and continue
+                pass
+
+        return text.strip()
+    except Exception:
+        # Fallback to non-streamed behavior
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_completion_tokens=long_max,
+                stream=False
+            )
+            try:
+                return completion.choices[0].message.content.strip()
+            except Exception:
+                text = ''
+                for chunk in completion:
+                    if chunk.choices[0].delta.content:
+                        text += chunk.choices[0].delta.content
+                return text.strip()
+        except Exception as e:
+            print(f"[GENERATE ERROR] {e}")
+            return ''
 
 
 def execute_via_ai_plan(client, user_command, language='en'):
@@ -470,6 +840,184 @@ def execute_via_ai_plan(client, user_command, language='en'):
         return False
 
     try:
+        print(f"[DEBUG EXECUTE] user_command='{user_command}'")
+        # Read configurable delays from environment at runtime so tests can override them
+        startup_sleep = float(os.getenv('SPOTIFY_STARTUP_SLEEP', str(SPOTIFY_STARTUP_SLEEP)))
+        post_space_delay = float(os.getenv('POST_SPACE_DELAY', str(POST_SPACE_DELAY)))
+        default_open_sleep = float(os.getenv('DEFAULT_OPEN_SLEEP', str(DEFAULT_OPEN_SLEEP)))
+        # ------ Special-case: direct essay/document generation commands ------
+        # Support variants: 'write essay on X' -> open notepad and write
+        #                 'type essay on X'  -> type into current focus
+        m = re.match(r"^\s*(write|type)\s+(esaay|essay|article|document)\s+on\s+(.+)$", user_command, flags=re.IGNORECASE)
+        if m:
+            verb = m.group(1).lower()
+            topic = m.group(3).strip()
+            # Need an AI client to generate long content
+            if not client:
+                print("[ESSAY ERROR] AI client required to generate long content.")
+                speak("I need the AI client configured to write long content. Please set GROQ_API_KEY.", language)
+                return False
+
+            # Build a rich prompt for long-form content, allow code if mentioned
+            prompt = (
+                f"Write a detailed, well-structured essay (about 400-800 words) on '{topic}'. "
+                "Use clear sections, examples, and a concise introduction and conclusion. "
+                "If the topic requests code or examples, include appropriate code blocks. "
+                f"Respond in {'Hindi' if language == 'hi' else 'English'}."
+            )
+
+            try:
+                content = generate_long_text(client, prompt, language=language)
+                if not content:
+                    print("[ESSAY ERROR] AI returned empty content")
+                    return False
+
+                # If user asked to 'write', open notepad first and then paste
+                if verb == 'write':
+                    open_path('notepad')
+                    time.sleep(1.2)
+                    set_clipboard_and_paste(content)
+                    print(f"[EXECUTED] WROTE essay on '{topic}' to Notepad")
+                    try:
+                        set_floating_focus()
+                    except Exception:
+                        pass
+                    return True
+
+                # If user asked to 'type', paste into current focus
+                set_clipboard_and_paste(content)
+                print(f"[EXECUTED] TYPED essay on '{topic}' into current focus")
+                try:
+                    set_floating_focus()
+                except Exception:
+                    pass
+                return True
+            except Exception as e:
+                print(f"[ESSAY ERROR] {e}")
+                return False
+        # Special-case: 'type code' -> generate code snippet and type into current focus
+        # Specific: 'type a <topic> code' or 'type <topic> code' -> pure code only (no comments/explanations)
+        m_topic_code = re.match(r"^\s*type\s+(?:a\s+)?(.+?)\s+code\s*$", user_command, flags=re.IGNORECASE)
+        if m_topic_code:
+            topic = m_topic_code.group(1).strip()
+            if not client:
+                print("[TYPE CODE ERROR] AI client required to generate code.")
+                speak("I need the AI client configured to generate code. Please set GROQ_API_KEY.", language)
+                return False
+            # Ask AI for pure code only
+            prompt = (
+                f"Provide ONLY runnable code (no comments, no explanations, no markdown fences) that implements: {topic}. "
+                "Return only the code output, nothing else."
+            )
+            try:
+                raw = generate_long_text(client, prompt, language=language)
+                if not raw:
+                    print("[TYPE CODE ERROR] AI returned empty content")
+                    return False
+
+                # Strip markdown fences and common comment styles
+                def strip_code(text: str) -> str:
+                    # Remove triple backtick fences and leading language tags
+                    text = re.sub(r"^```[a-zA-Z0-9+-]*\n", "", text)
+                    text = re.sub(r"\n```$", "", text)
+                    # Remove any fenced blocks like ```python ... ``` anywhere
+                    text = re.sub(r"```[\s\S]*?```", lambda m: re.sub(r"^```[a-zA-Z0-9+-]*\n|\n```$", "", m.group(0)), text)
+                    # Remove common single-line comment prefixes
+                    out_lines = []
+                    in_block = False
+                    for line in text.splitlines():
+                        s = line.strip()
+                        if s.startswith('/*'):
+                            in_block = True
+                            continue
+                        if in_block:
+                            if '*/' in s:
+                                in_block = False
+                            continue
+                        if s.startswith('//') or s.startswith('#') or s.startswith('--'):
+                            continue
+                        out_lines.append(line)
+                    cleaned = '\n'.join(out_lines).strip()
+                    # Remove any leftover fence markers
+                    cleaned = cleaned.replace('```', '')
+                    # Also remove lines that are only backticks
+                    cleaned = '\n'.join([ln for ln in cleaned.splitlines() if ln.strip() != '```'])
+                    return cleaned.strip()
+
+                content = strip_code(raw)
+                if not content:
+                    print("[TYPE CODE ERROR] Content empty after stripping comments/fences")
+                    return False
+                set_clipboard_and_paste(content)
+                print(f"[EXECUTED] TYPED pure code for '{topic}' into current focus")
+                try:
+                    set_floating_focus()
+                except Exception:
+                    pass
+                return True
+            except Exception as e:
+                print(f"[TYPE CODE ERROR] {e}")
+                return False
+
+        m_code = re.match(r"^\s*type\s+code(?:\s+(.+))?$", user_command, flags=re.IGNORECASE)
+        if m_code:
+            topic = (m_code.group(1) or '').strip()
+            if not client:
+                print("[TYPE CODE ERROR] AI client required to generate code.")
+                speak("I need the AI client configured to generate code. Please set GROQ_API_KEY.", language)
+                return False
+            prompt = (
+                f"Write a clear, runnable code snippet{(' to ' + topic) if topic else ''}. "
+                "Include brief comments and only return the code and comments."
+            )
+            try:
+                content = generate_long_text(client, prompt, language=language)
+                if not content:
+                    print("[TYPE CODE ERROR] AI returned empty content")
+                    return False
+                set_clipboard_and_paste(content)
+                print(f"[EXECUTED] TYPED code{(' for ' + topic) if topic else ''} into current focus")
+                try:
+                    set_floating_focus()
+                except Exception:
+                    pass
+                return True
+            except Exception as e:
+                print(f"[TYPE CODE ERROR] {e}")
+                return False
+
+        # ------------------------------------------------------------------
+        # Generic write command: 'write <anything>' -> open Notepad and write AI response
+        m2 = re.match(r"^\s*write\s+(.+)$", user_command, flags=re.IGNORECASE)
+        if m2:
+            prompt_body = m2.group(1).strip()
+            # Avoid matching the 'write essay' case which is handled above
+            if re.match(r"^(esaay|essay|type)\b", prompt_body, flags=re.IGNORECASE):
+                pass
+            else:
+                if not client:
+                    print("[WRITE ERROR] AI client required to write content.")
+                    speak("I need the AI client configured to write content. Please set GROQ_API_KEY.", language)
+                    return False
+                try:
+                    # Use a flexible prompt to generate a relevant piece of text
+                    gen_prompt = f"Write a helpful and well-structured piece based on: {prompt_body}."
+                    content = generate_long_text(client, gen_prompt, language=language)
+                    if not content:
+                        print("[WRITE ERROR] AI returned empty content")
+                        return False
+                    open_path('notepad')
+                    time.sleep(1.0)
+                    set_clipboard_and_paste(content)
+                    print(f"[EXECUTED] WROTE '{prompt_body}' to Notepad")
+                    try:
+                        set_floating_focus()
+                    except Exception:
+                        pass
+                    return True
+                except Exception as e:
+                    print(f"[WRITE ERROR] {e}")
+                    return False
         # Build a meta-instruction for the AI: analyze the command and output executable actions
         meta_instruction = (
             f"You are Nova's AI action executor. Analyze the user's command and output a list of executable actions.\n"
@@ -491,6 +1039,7 @@ def execute_via_ai_plan(client, user_command, language='en'):
             f"ACTION: YOUTUBE_PLAY song name\n"
             f"ACTION: PRESS alt+tab\n"
             f"\n"
+            f"- For web apps like Instagram, if the user mentions 'chat', 'inbox', or 'messages', open the direct inbox URL (e.g., https://www.instagram.com/direct/inbox/).\n"
             f"OTHER EXAMPLES:\n"
             f"- 'open notepad and write' → OPEN notepad → SLEEP 1 → TYPE the content\n"
             f"- 'set alarm for 7 pm' → SET_ALARM 19:00\n"
@@ -522,9 +1071,9 @@ def execute_via_ai_plan(client, user_command, language='en'):
             f"- Do NOT include 'Reason:', explanations, reasoning, or any text after actions\n"
             f"- Do NOT output arrows (→), examples, or commentary\n"
             f"- EVERY action MUST be on a new line and start with 'ACTION:'\n"
-            f"- ALWAYS add SLEEP or WAIT_FOR_PAGE after OPEN (use SLEEP 3 for web URLs, SLEEP 1 for apps)\n"
+            f"- ALWAYS add SLEEP or WAIT_FOR_PAGE after OPEN (use SLEEP 1-2 for web URLs, SLEEP 1 for apps)\n"
             f"- Add SLEEP 0.5 between TYPE and PRESS enter for page interaction\n"
-            f"- For YouTube: After PRESS enter (search), add SLEEP 2, then CLICK left (first video), SLEEP 2, then CLICK left (play video)\n"
+            f"- For YouTube: Prefer using 'YOUTUBE_PLAY <query>' which should auto-open and play the first result; do NOT add extra SLEEP/CLICK/PRESS steps after a YOUTUBE_PLAY action.\n"
             f"- IMPORTANT: Only add PRESS alt+tab if user explicitly says 'background' or 'minimize'\n"
             f"- For media/music: assume the media player or Spotify is already focused when user says 'skip', 'pause', etc.\n"
             f"- If user says 'skip again' or 'skip more', chain multiple PRESS right actions\n"
@@ -552,11 +1101,15 @@ def execute_via_ai_plan(client, user_command, language='en'):
             "actions": []
         }
 
-        # Parse and execute actions
+        # Parse and execute actions (use index-based loop so we can skip redundant steps)
         print(f"[AI PLAN]\n{plan_text}\n")
         actions_executed = 0
-        for line in plan_text.splitlines():
-            line = line.strip()
+        suppress_done_speak = False
+        plan_lines = [l.strip() for l in plan_text.splitlines() if l.strip()]
+        i = 0
+        while i < len(plan_lines):
+            line = plan_lines[i]
+            i += 1
             if not line.lower().startswith('action:'):
                 continue
 
@@ -573,6 +1126,17 @@ def execute_via_ai_plan(client, user_command, language='en'):
                 if action_type == "OPEN":
                     # Parse URL or path from param
                     target = action_param.strip('"\'')
+                    # Smart resolution: try mappings and AI to normalize ambiguous targets
+                    try:
+                        kind, resolved = resolve_open_target(client, target, user_command, language)
+                        if kind == 'url' and resolved:
+                            target = resolved
+                        elif kind == 'path' and resolved:
+                            target = resolved
+                        elif kind == 'app' and resolved:
+                            target = resolved
+                    except Exception:
+                        pass
                     # Special-case: if user or AI referenced alarms/clock, open Windows Alarms & Clock
                     if target and any(k in target.lower() for k in ['alarm', 'alarms', 'clock']):
                         try:
@@ -615,6 +1179,16 @@ def execute_via_ai_plan(client, user_command, language='en'):
                                 'action': 'OPEN', 'target': target, 'result': 'opened_in_browser'
                             })
                             print(f"[EXECUTED] OPEN {target}")
+                        # If opening Spotify, and next action is an immediate PRESS space, wait briefly to allow app to start
+                        try:
+                            if 'spotify' in target.lower() and i < len(plan_lines):
+                                nxt = plan_lines[i].lower()
+                                if nxt.startswith('action: press') and 'space' in nxt:
+                                    time.sleep(startup_sleep)
+                                    log_entry['actions'].append({'action': 'SLEEP', 'seconds': startup_sleep, 'reason': 'spotify_startup'})
+                                    print(f"[AUTO SLEEP] Waited {startup_sleep}s for Spotify to start")
+                        except Exception:
+                            pass
                     elif is_local_app or os.path.exists(target):
                         # It's a local application or file/folder
                         open_path(target)
@@ -625,6 +1199,16 @@ def execute_via_ai_plan(client, user_command, language='en'):
                             'action': 'OPEN', 'target': target, 'result': 'opened_local'
                         })
                         print(f"[EXECUTED] OPEN {target}")
+                        # If opening Spotify, and next action is PRESS space, wait briefly before the next action
+                        try:
+                            if 'spotify' in target.lower() and i < len(plan_lines):
+                                nxt = plan_lines[i].lower()
+                                if nxt.startswith('action: press') and 'space' in nxt:
+                                    time.sleep(startup_sleep)
+                                    log_entry['actions'].append({'action': 'SLEEP', 'seconds': startup_sleep, 'reason': 'spotify_startup'})
+                                    print(f"[AUTO SLEEP] Waited {startup_sleep}s for Spotify to start")
+                        except Exception:
+                            pass
                     else:
                         # Try as a local app/path anyway
                         open_path(target)
@@ -635,6 +1219,16 @@ def execute_via_ai_plan(client, user_command, language='en'):
                             'action': 'OPEN', 'target': target, 'result': 'opened_fallback'
                         })
                         print(f"[EXECUTED] OPEN {target}")
+                        # If opening Spotify (fallback case), and next action is PRESS space, wait briefly
+                        try:
+                            if 'spotify' in target.lower() and i < len(plan_lines):
+                                nxt = plan_lines[i].lower()
+                                if nxt.startswith('action: press') and 'space' in nxt:
+                                    time.sleep(startup_sleep)
+                                    log_entry['actions'].append({'action': 'SLEEP', 'seconds': startup_sleep, 'reason': 'spotify_startup'})
+                                    print(f"[AUTO SLEEP] Waited {startup_sleep}s for Spotify to start")
+                        except Exception:
+                            pass
 
                 elif action_type == "SET_ALARM":
                     # action_param expected like '19:00' or '7 pm' or '07:00 PM'
@@ -658,6 +1252,18 @@ def execute_via_ai_plan(client, user_command, language='en'):
 
                 elif action_type == "SEARCH":
                     query = action_param.strip('"\'')
+                    # If the user's original command referenced YouTube or asked to play a video,
+                    # prefer the quick YOUTUBE_PLAY path to avoid slow typed-search + clicks.
+                    uc = user_command.lower() if 'user_command' in locals() else ''
+                    if 'youtube' in uc or ('play' in uc and 'video' in uc):
+                        status = play_youtube(query)
+                        if status in ('playing', 'search_opened'):
+                            actions_executed += 1
+                            CURRENT_APP_CONTEXT = 'youtube'
+                            log_entry['actions'].append({'action': 'SEARCH', 'query': query, 'result': status})
+                            print(f"[EXECUTED] SEARCH (youtube) {query}")
+                            continue
+                        # else fall through to normal search behavior
                     # Detect if browser is open, otherwise use Chrome
                     if not CURRENT_APP_CONTEXT or CURRENT_APP_CONTEXT not in ['chrome', 'browser']:
                         detect_and_set_browser_context()
@@ -717,26 +1323,43 @@ def execute_via_ai_plan(client, user_command, language='en'):
                     if '+' in keys:
                         key_parts = [k.strip() for k in keys.split('+')]
                         if HAS_PYAUTOGUI:
-                            pyautogui.hotkey(*key_parts)
-                            actions_executed += 1
-                            log_entry['actions'].append({
-                                'action': 'PRESS', 'keys': keys, 'result': 'hotkey_executed'
-                            })
-                            print(f"[EXECUTED] PRESS {keys}")
+                            try:
+                                pyautogui.hotkey(*key_parts)
+                                actions_executed += 1
+                                log_entry['actions'].append({
+                                    'action': 'PRESS', 'keys': keys, 'result': 'hotkey_executed'
+                                })
+                                print(f"[EXECUTED] PRESS {keys}")
+                            except Exception as e:
+                                print(f"[PRESS ERROR] pyautogui hotkey failed: {e}")
                         else:
                             print(f"[PRESS ERROR] pyautogui not available for key combination: {keys}")
                     else:
                         # Single key press (including media keys like volumeup, volumedown)
                         mapped_key = key_map.get(keys, keys)
                         if HAS_PYAUTOGUI:
-                            pyautogui.press(mapped_key)
-                            actions_executed += 1
-                            log_entry['actions'].append({
-                                'action': 'PRESS', 'keys': mapped_key, 'result': 'pressed'
-                            })
-                            print(f"[EXECUTED] PRESS {keys}")
+                            try:
+                                pyautogui.press(mapped_key)
+                                actions_executed += 1
+                                log_entry['actions'].append({
+                                    'action': 'PRESS', 'keys': mapped_key, 'result': 'pressed'
+                                })
+                                print(f"[EXECUTED] PRESS {keys}")
+                            except Exception as e:
+                                print(f"[PRESS ERROR] pyautogui press failed: {e}")
                         else:
                             print(f"[PRESS ERROR] pyautogui not available for key: {keys}")
+                        # If we just pressed space (or attempted to), and next action is an immediate alt+tab, give a short pause
+                        try:
+                            if mapped_key == 'space' and i < len(plan_lines):
+                                nxt = plan_lines[i].lower()
+                                # If next action will switch/minimize or is another key press, allow a short delay
+                                if 'alt+tab' in nxt or 'alt+f9' in nxt or nxt.startswith('action: press') or nxt.startswith('action: switch') or nxt.startswith('action: open'):
+                                    time.sleep(post_space_delay)
+                                    log_entry['actions'].append({'action': 'SLEEP', 'seconds': post_space_delay, 'reason': 'post_space_delay'})
+                                    print(f"[AUTO SLEEP] Waited {post_space_delay}s after space before next action")
+                        except Exception:
+                            pass
 
                 elif action_type == "CLICK":
                     button = action_param.strip('"\'').lower() or 'left'
@@ -804,13 +1427,37 @@ def execute_via_ai_plan(client, user_command, language='en'):
 
                 elif action_type == "YOUTUBE_PLAY":
                     video_query = action_param.strip('"\'')
-                    if play_youtube(video_query):
+                    status = play_youtube(video_query)
+                    if status == 'playing':
                         actions_executed += 1
                         CURRENT_APP_CONTEXT = 'youtube'
+                        suppress_done_speak = True
+                        # pause listening briefly to avoid capturing the video's audio
+                        try:
+                            global LISTEN_SUSPEND_UNTIL
+                            LISTEN_SUSPEND_UNTIL = time.time() + 3.0
+                        except Exception:
+                            pass
                         log_entry['actions'].append({
                             'action': 'YOUTUBE_PLAY', 'query': video_query, 'result': 'playing'
                         })
                         print(f"[EXECUTED] YOUTUBE_PLAY {video_query}")
+                        # Skip any immediately following UI steps that try to click the search results
+                        # (common plans include PRESS enter / SLEEP / CLICK left after a YOUTUBE_PLAY)
+                        while i < len(plan_lines):
+                            nxt = plan_lines[i].lower()
+                            if nxt.startswith('action: sleep') or nxt.startswith('action: press') or nxt.startswith('action: click') or nxt.startswith('action: wait_for_page'):
+                                i += 1
+                                continue
+                            break
+                    elif status == 'search_opened':
+                        # Search page opened; still count as an executed action
+                        actions_executed += 1
+                        CURRENT_APP_CONTEXT = 'youtube'
+                        log_entry['actions'].append({
+                            'action': 'YOUTUBE_PLAY', 'query': video_query, 'result': 'search_opened'
+                        })
+                        print(f"[EXECUTED] YOUTUBE_PLAY (search opened) {video_query}")
                     else:
                         print(f"[YOUTUBE_PLAY ERROR] Could not find or play video: {video_query}")
                         log_entry['actions'].append({
@@ -825,7 +1472,12 @@ def execute_via_ai_plan(client, user_command, language='en'):
             print(f"[SUCCESS] Executed {actions_executed} action(s)")
             try:
                 # Speak a short 'Done' confirmation after executing actions
-                speak('Done', language)
+                if not suppress_done_speak:
+                    speak('Done', language)
+            except Exception:
+                pass
+            try:
+                set_floating_focus()
             except Exception:
                 pass
             # write audit log line
@@ -932,6 +1584,10 @@ def open_path(path):
     if isinstance(path, str) and path.lower().startswith('http'):
         try:
             webbrowser.open(path)
+            try:
+                _maybe_auto_alt_tab()
+            except Exception:
+                pass
             return True
         finally:
             # keep context as-is for follow-up actions
@@ -943,10 +1599,13 @@ def open_path(path):
             os.startfile(path)
             # set last opened
             LAST_OPENED_TARGET = path
+            try:
+                _maybe_auto_alt_tab()
+            except Exception:
+                pass
             return True
         except Exception:
             pass
-
     # Try to resolve executable on PATH (e.g., 'chrome', 'whatsapp' if in PATH)
     try:
         import shutil
@@ -955,6 +1614,10 @@ def open_path(path):
             try:
                 subprocess.Popen([exe_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 LAST_OPENED_TARGET = exe_path
+                try:
+                    _maybe_auto_alt_tab()
+                except Exception:
+                    pass
                 return True
             except Exception:
                 pass
@@ -965,6 +1628,10 @@ def open_path(path):
     try:
         subprocess.Popen([path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         LAST_OPENED_TARGET = path
+        try:
+            _maybe_auto_alt_tab()
+        except Exception:
+            pass
         return True
     except Exception:
         pass
@@ -973,6 +1640,10 @@ def open_path(path):
     try:
         subprocess.Popen(['cmd', '/c', 'start', '', path], shell=True)
         LAST_OPENED_TARGET = path
+        try:
+            _maybe_auto_alt_tab()
+        except Exception:
+            pass
         return True
     except Exception:
         pass
@@ -981,6 +1652,10 @@ def open_path(path):
     try:
         subprocess.Popen(["powershell", "-Command", f"Start-Process '{path}'"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         LAST_OPENED_TARGET = path
+        try:
+            _maybe_auto_alt_tab()
+        except Exception:
+            pass
         return True
     except Exception as e:
         print(f"[OPEN ERROR] Could not open {path}: {e}")
@@ -1217,9 +1892,34 @@ def check_wake_word(text):
         return False, ""
 
 
-def play_youtube(query):
-    """Search YouTube and open first video result in browser."""
+def play_youtube(query: str) -> str:
+    """Search YouTube and open first video result in browser.
+
+    Returns a status string: 'playing', 'search_opened', or 'failed'.
+    """
     try:
+        # If the user provided a direct YouTube URL, open it and try to autoplay
+        if 'youtube.com/watch' in query or 'youtu.be/' in query:
+            # normalize and ensure autoplay
+            url = query.strip('"\'')
+            if 'autoplay=1' not in url:
+                sep = '&' if '?' in url else '?'
+                url = url + sep + 'autoplay=1'
+            webbrowser.open(url)
+            # give browser a moment then attempt to ensure playback
+            if HAS_PYAUTOGUI:
+                time.sleep(0.4)
+                try:
+                    pyautogui.press('space')
+                except Exception:
+                    pass
+            logger.info("Opened YouTube URL for autoplay")
+            try:
+                set_floating_status('Playing...')
+            except Exception:
+                pass
+            return 'playing'
+
         q = requests.utils.requote_uri(query)
         search_url = f"https://www.youtube.com/results?search_query={q}"
         resp = requests.get(search_url, timeout=10)
@@ -1228,15 +1928,127 @@ def play_youtube(query):
             m = re.search(r"/watch\?v=([\w-]{11})", resp.text)
             if m:
                 vid = m.group(1)
-                watch_url = f"https://www.youtube.com/watch?v={vid}"
+                watch_url = f"https://www.youtube.com/watch?v={vid}&autoplay=1"
                 webbrowser.open(watch_url)
-                return True
-        # fallback: open search page
+                # short delay then ensure playback keypress if available
+                if HAS_PYAUTOGUI:
+                    time.sleep(0.4)
+                    try:
+                        pyautogui.press('space')
+                    except Exception:
+                        pass
+                logger.info("Opened first YouTube search result for autoplay")
+                try:
+                    set_floating_status('Playing...')
+                except Exception:
+                    pass
+                return 'playing'
+        # fallback: open search page (no video found)
         webbrowser.open(search_url)
-        return True
+        logger.info("Opened YouTube search page (no direct video found)")
+        return 'search_opened'
     except Exception as e:
-        print(f"[YT ERROR] {e}")
-        return False
+        logger.exception("YouTube playback error")
+        return 'failed'
+
+
+def resolve_open_target(client, raw_target: str, user_command: str = '', language='en') -> Tuple[str, str]:
+    """Resolve an OPEN target to a concrete URL, local app, or path.
+    Returns: (kind, value) where kind in ('url','app','path','none').
+    Uses `app_mappings.json` first, then falls back to AI if client is provided.
+    """
+    if not raw_target:
+        return 'none', ''
+    t = raw_target.strip().lower().strip('"\'')
+    # Load mappings
+    mappings_file = os.path.join(os.path.dirname(__file__), 'app_mappings.json')
+    try:
+        if os.path.exists(mappings_file):
+            with open(mappings_file, 'r', encoding='utf-8') as mf:
+                app_map = json.load(mf)
+                # If user_command mentions a sub-target (e.g., 'chats','inbox') prefer more specific mappings
+                uc = (user_command or '').lower()
+                if 'instagram' in t or 'instagram' in uc:
+                    if any(k in uc for k in ['chat', 'chats', 'inbox', 'message', 'messages', 'direct']):
+                        for key in ['instagram chats', 'instagram chat', 'instagram inbox', 'insta inbox']:
+                            if key in app_map:
+                                val = app_map[key]
+                                return 'url', val
+                if t in app_map:
+                    # If the user command references a more specific sub-target (inbox/messages/chats),
+                    # prefer a combined mapping like 'twitter messages' over the generic 'twitter'.
+                    uc = (user_command or '').lower()
+                    for suffix in [' messages', ' dms', ' dm', ' inbox', ' chats', ' chat']:
+                        combined = f"{t}{suffix}"
+                        if combined in app_map and any(k.strip() in uc for k in [suffix.strip()]):
+                            val = app_map[combined]
+                            if is_likely_url(val):
+                                return 'url', val
+                            elif os.path.exists(val) or val.lower().endswith('.exe') or ':' in val:
+                                return 'path', val
+                            else:
+                                return 'app', val
+                    # Otherwise return the generic mapping
+                    val = app_map[t]
+                    if is_likely_url(val):
+                        return 'url', val
+                    elif os.path.exists(val) or val.lower().endswith('.exe') or ':' in val:
+                        return 'path', val
+                    else:
+                        return 'app', val
+                # If no exact match, try substring keys (e.g., user said 'gmail inbox' or 'open gmail')
+                # Iterate keys in order of decreasing length so specific mappings win (e.g., 'twitter messages' before 'twitter')
+                for key in sorted(app_map.keys(), key=len, reverse=True):
+                    if key in t or key in uc:
+                        val = app_map[key]
+                        if is_likely_url(val):
+                            return 'url', val
+                        elif os.path.exists(val) or val.lower().endswith('.exe') or ':' in val:
+                            return 'path', val
+                        else:
+                            return 'app', val
+                # Fallback: try fuzzy match on keys
+                try:
+                    from difflib import get_close_matches
+                    candidates = get_close_matches(t, list(app_map.keys()), n=1, cutoff=0.7)
+                    if candidates:
+                        val = app_map[candidates[0]]
+                        if is_likely_url(val):
+                            return 'url', val
+                        elif os.path.exists(val) or val.lower().endswith('.exe') or ':' in val:
+                            return 'path', val
+                        else:
+                            return 'app', val
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # If looks like URL
+    if is_likely_url(t):
+        return 'url', raw_target.strip('"\'')
+
+    # If client available, ask AI to normalize target (single-line response: URL:<url> or APP:<app> or PATH:<path>)
+    if client:
+        prompt = (
+            f"You are a concise normalizer. Given a brief open target and the user's original command, return a single line identifying the concrete target in one of these formats:\n"
+            f"URL:<url>\nAPP:<app_key>\nPATH:<path>\nIf you cannot determine, return NONE.\nExamples:\nopen instagram chats -> URL:https://www.instagram.com/direct/inbox/\nopen instagram -> URL:https://www.instagram.com/\nopen notepad -> APP:notepad\nNow, target: '{raw_target}'\nuser_command: '{user_command}'\n"
+        )
+        try:
+            resp = get_ai_response(client, [{"role": "user", "content": prompt}], language=language)
+            if not resp:
+                return 'none', ''
+            line = resp.strip().splitlines()[0].strip()
+            if line.upper().startswith('URL:'):
+                return 'url', line[4:].strip()
+            if line.upper().startswith('APP:'):
+                return 'app', line[4:].strip()
+            if line.upper().startswith('PATH:'):
+                return 'path', line[5:].strip()
+        except Exception:
+            pass
+
+    return 'none', ''
 
 
 def parse_time_string(s: str):
@@ -1654,8 +2466,25 @@ def main():
     ENABLE_REASONING_FLAG = os.getenv('ENABLE_REASONING', 'false').lower() in ['1', 'true', 'yes']
     
     # Continuous conversation loop
+    # Start a small floating window (always-on-top) for quick status by default.
+    # To disable, set FLOATING_WINDOW=false in environment.
+    env = os.getenv('FLOATING_WINDOW')
+    if env is None or env.lower() in ['1', 'true', 'yes']:
+        try:
+            started = start_floating_window()
+            if started:
+                print('[FLOATING] Floating status window started')
+        except Exception as e:
+            print(f"[FLOATING ERROR] {e}")
+
     while True:
         try:
+            # If audio output (e.g., YouTube) just started, pause wake-word listening briefly
+            if time.time() < LISTEN_SUSPEND_UNTIL:
+                rem = LISTEN_SUSPEND_UNTIL - time.time()
+                print(f"[PAUSING LISTENING] Waiting {rem:.1f}s to avoid audio interference...", flush=True)
+                time.sleep(rem)
+                continue
             # If wake word is enabled, listen for wake word first
             if WAKE_WORD_ENABLED:
                 print(f"[WAKE WORD LISTENING] Say '{WAKE_WORD}' to activate...", flush=True)
@@ -1839,6 +2668,10 @@ def main():
         
         except KeyboardInterrupt:
             print("\n[STOPPED] Goodbye!")
+            try:
+                stop_floating_window()
+            except Exception:
+                pass
             break
         except Exception as e:
             print(f"[ERROR] {e}")

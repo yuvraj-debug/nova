@@ -1,30 +1,6 @@
 [
   {
     "role": "user",
-    "content": "hey what's up man"
-  },
-  {
-    "role": "assistant",
-    "content": "Not much, just here for you, what's on your mind?"
-  },
-  {
-    "role": "user",
-    "content": "yaar kya kar raha hai"
-  },
-  {
-    "role": "assistant",
-    "content": "Main tumhare liye cricket match ke updates khol sakta hoon, chahe yeh India versus Pakistan ho ya koi anya match."
-  },
-  {
-    "role": "user",
-    "content": "khol do"
-  },
-  {
-    "role": "assistant",
-    "content": "1. Check ICC website for live scores and updates.\n2. Open ESPN Cricinfo app for real-time match analysis.\n3. Get match highlights and reviews on YouTube channels like ESPNcricinfo.\n4. Follow cricket news websites like Cricbuzz for latest updates.\n5. Download the Match Tracker app for push notifications and live scores.\n\nReason: Providing multiple sources for live cricket updates."
-  },
-  {
-    "role": "user",
     "content": "play music"
   },
   {
@@ -38,5 +14,29 @@
   {
     "role": "assistant",
     "content": "1. Open YouTube and search for \"MrBeast latest video\".\n2. Go to MrBeast's official YouTube channel and check the latest uploads.\n3. Click on the \"Uploads\" tab to see the latest videos.\n4. Visit MrBeast's social media pages for video links.\n5. Subscribe to MrBeast's channel for notifications.\n\nReason: Quickly finding the latest MrBeast content."
+  },
+  {
+    "role": "user",
+    "content": "set alarm for 10:00 p.m."
+  },
+  {
+    "role": "assistant",
+    "content": "1. Open your device's clock app and select the alarm option.\n2. Set the alarm time to 10:00 PM.\n3. Choose a ringtone or select an alarm sound.\n4. Set the alarm to repeat or one-time.\n5. Save the alarm settings.\n\nReason: Setting the alarm for a specific time."
+  },
+  {
+    "role": "user",
+    "content": "write an"
+  },
+  {
+    "role": "assistant",
+    "content": "I think you meant to say \"write a poem\" or \"write a message\"! If so:\n\n1. Open a note-taking app like Evernote or OneNote.\n2. Type in the message or poem you want to write.\n3. Choose a font and formatting options.\n4. Add any images or emojis to the message.\n5. Save the note or message.\n\nReason: Creating a new written content."
+  },
+  {
+    "role": "user",
+    "content": "close notepad"
+  },
+  {
+    "role": "assistant",
+    "content": "1. Press the back button on your device.\n2. Swipe down from the top of the screen to close the app.\n3. Click on the \"X\" button at the top right corner of the app.\n4. Use the \"Recent Apps\" menu to close the app.\n5. Force-close the app on your device's settings.\n\nReason: Ending the Notepad app process."
   }
 ]

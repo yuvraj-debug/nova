@@ -9,3 +9,8 @@ webdriver-manager
 groq
 pyperclip
 pywinauto
+pygetwindow
+numpy
+pytest
+flake8
+pre-commit
